@@ -331,3 +331,65 @@
     (ok true)
   )
 )
+
+;; read only functions
+
+;; Get policy details
+(define-read-only (get-policy (policy-id uint))
+  (map-get? policies { policy-id: policy-id })
+)
+
+;; Get member's policies
+(define-read-only (get-member-policies (member principal))
+  (map-get? member-policies { member: member })
+)
+
+;; Get claim details
+(define-read-only (get-claim (claim-id uint))
+  (map-get? claims { claim-id: claim-id })
+)
+
+;; Get pool statistics
+(define-read-only (get-pool-stats)
+  {
+    total-balance: (var-get total-pool-balance),
+    total-policies: (var-get policy-counter),
+    total-claims: (var-get claim-counter),
+    pool-active: (var-get pool-active)
+  }
+)
+
+;; Check if address is pool member
+(define-read-only (is-pool-member (member principal))
+  (is-some (map-get? member-policies { member: member }))
+)
+
+;; Get risk adjustment history
+(define-read-only (get-risk-adjustment (policy-id uint))
+  (map-get? risk-adjustments { policy-id: policy-id })
+)
+
+;; Calculate premium for risk score
+(define-read-only (calculate-premium (risk-score uint))
+  (/ (* BASE_PREMIUM risk-score) u50)
+)
+
+;; private functions
+
+;; Validate risk score range
+(define-private (is-valid-risk-score (score uint))
+  (and (>= score MIN_RISK_SCORE) (<= score MAX_RISK_SCORE))
+)
+
+;; Calculate surplus distribution for member
+(define-private (calculate-member-surplus (policy-id uint) (total-surplus uint))
+  (match (map-get? policies { policy-id: policy-id })
+    policy (let (
+      (risk-factor (- u100 (get risk-score policy)))
+      (time-factor (if (> burn-block-height (get last-updated policy)) u100 u50))
+    )
+      (/ (* total-surplus risk-factor time-factor) u10000)
+    )
+    u0
+  )
+)
