@@ -27,12 +27,21 @@
 (define-constant ERR_VOTING_ENDED (err u106))
 (define-constant ERR_ALREADY_VOTED (err u107))
 (define-constant ERR_NOT_MEMBER (err u108))
+(define-constant ERR_CONTRACT_PAUSED (err u109))
+(define-constant ERR_OVERFLOW (err u110))
+(define-constant ERR_UNDERFLOW (err u111))
+(define-constant ERR_RATE_LIMIT_EXCEEDED (err u112))
+(define-constant ERR_INVALID_INPUT (err u113))
+(define-constant ERR_CLAIM_AMOUNT_TOO_HIGH (err u114))
 
 (define-constant MIN_RISK_SCORE u1)
 (define-constant MAX_RISK_SCORE u100)
 (define-constant BASE_PREMIUM u1000000) ;; 1 STX in microSTX
 (define-constant CLAIM_VOTING_PERIOD u144) ;; ~24 hours in blocks
 (define-constant MIN_POOL_BALANCE u10000000) ;; 10 STX minimum pool balance
+(define-constant RATE_LIMIT_BLOCKS u10) ;; Minimum blocks between operations
+(define-constant MAX_CLAIM_AMOUNT u100000000) ;; 100 STX maximum claim
+(define-constant MAX_POLICIES_PER_MEMBER u10)
 
 ;; data vars
 (define-data-var total-pool-balance uint u0)
@@ -95,19 +104,74 @@
   { amount: uint, claimed: bool }
 )
 
+(define-map last-operation-block principal uint) ;; Rate limiting
+
+;; Security helper functions
+
+(define-private (safe-add (a uint) (b uint))
+  (let ((result (+ a b)))
+    (asserts! (>= result a) ERR_OVERFLOW)
+    (ok result)))
+
+(define-private (safe-sub (a uint) (b uint))
+  (if (>= a b)
+    (ok (- a b))
+    ERR_UNDERFLOW))
+
+(define-private (safe-mul (a uint) (b uint))
+  (let ((result (* a b)))
+    (asserts! (or (is-eq b u0) (is-eq (/ result b) a)) ERR_OVERFLOW)
+    (ok result)))
+
+(define-private (safe-div (a uint) (b uint))
+  (if (> b u0)
+    (ok (/ a b))
+    ERR_INVALID_INPUT))
+
+(define-private (check-rate-limit (user principal))
+  (let ((current-block burn-block-height)
+        (last-block (default-to u0 (map-get? last-operation-block user))))
+    (asserts! (>= (- current-block last-block) RATE_LIMIT_BLOCKS) ERR_RATE_LIMIT_EXCEEDED)
+    (map-set last-operation-block user current-block)
+    (ok true)))
+
+(define-private (validate-vehicle-id (vehicle-id (string-ascii 64)))
+  (if (> (len vehicle-id) u0)
+    (ok true)
+    ERR_INVALID_INPUT))
 
 ;; public functions
+
+;; Pause pool (owner only)
+(define-public (pause-pool)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (var-get pool-active) ERR_INVALID_INPUT)
+    (var-set pool-active false)
+    (ok true)))
+
+;; Unpause pool (owner only)
+(define-public (unpause-pool)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (not (var-get pool-active)) ERR_INVALID_INPUT)
+    (var-set pool-active true)
+    (ok true)))
 
 ;; Join the insurance pool with a new policy
 (define-public (join-pool (vehicle-id (string-ascii 64)) (initial-deposit uint))
   (let (
-    (policy-id (+ (var-get policy-counter) u1))
+    (current-counter (var-get policy-counter))
+    (policy-id (unwrap! (safe-add current-counter u1) ERR_OVERFLOW))
     (caller tx-sender)
   )
-    (asserts! (var-get pool-active) ERR_NOT_AUTHORIZED)
+    (asserts! (var-get pool-active) ERR_CONTRACT_PAUSED)
     (asserts! (>= initial-deposit BASE_PREMIUM) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (> initial-deposit u0) ERR_INVALID_INPUT)
+    (try! (validate-vehicle-id vehicle-id))
+    (try! (check-rate-limit caller))
     
-    ;; Transfer initial deposit to contract
+    ;; Transfer initial deposit to contract (external call first - reentrancy protection)
     (try! (stx-transfer? initial-deposit caller (as-contract tx-sender)))
     
     ;; Mint policy NFT
@@ -130,6 +194,7 @@
     ;; Update member policies list
     (let ((current-policies (default-to { policy-ids: (list) } 
                                        (map-get? member-policies { member: caller }))))
+      (asserts! (< (len (get policy-ids current-policies)) MAX_POLICIES_PER_MEMBER) ERR_INVALID_INPUT)
       (map-set member-policies
         { member: caller }
         { policy-ids: (unwrap! (as-max-len? 
@@ -138,9 +203,9 @@
       )
     )
     
-    ;; Update counters and pool balance
+    ;; Update counters and pool balance with safe math
     (var-set policy-counter policy-id)
-    (var-set total-pool-balance (+ (var-get total-pool-balance) initial-deposit))
+    (var-set total-pool-balance (unwrap! (safe-add (var-get total-pool-balance) initial-deposit) ERR_OVERFLOW))
     
     (ok policy-id)
   )
@@ -152,6 +217,7 @@
     (oracle (unwrap! (var-get oracle-address) ERR_NOT_AUTHORIZED))
     (policy (unwrap! (map-get? policies { policy-id: policy-id }) ERR_POLICY_NOT_FOUND))
   )
+    (asserts! (var-get pool-active) ERR_CONTRACT_PAUSED)
     (asserts! (is-eq tx-sender oracle) ERR_NOT_AUTHORIZED)
     (asserts! (and (>= new-risk-score MIN_RISK_SCORE) 
                    (<= new-risk-score MAX_RISK_SCORE)) ERR_INVALID_RISK_SCORE)
@@ -159,10 +225,12 @@
     
     (let (
       (old-score (get risk-score policy))
+      (score-product (unwrap! (safe-mul new-risk-score u100) ERR_OVERFLOW))
       (adjustment-factor (if (> new-risk-score old-score)
-                            (/ (* new-risk-score u100) old-score)
-                            (/ (* old-score u100) new-risk-score)))
-      (new-premium (/ (* BASE_PREMIUM new-risk-score) u50))
+                            (unwrap! (safe-div score-product old-score) ERR_INVALID_INPUT)
+                            (unwrap! (safe-div (unwrap! (safe-mul old-score u100) ERR_OVERFLOW) new-risk-score) ERR_INVALID_INPUT)))
+      (premium-product (unwrap! (safe-mul BASE_PREMIUM new-risk-score) ERR_OVERFLOW))
+      (new-premium (unwrap! (safe-div premium-product u50) ERR_INVALID_INPUT))
     )
       ;; Update policy with new risk score and premium
       (map-set policies
@@ -196,25 +264,31 @@
     (policy (unwrap! (map-get? policies { policy-id: policy-id }) ERR_POLICY_NOT_FOUND))
     (caller tx-sender)
   )
+    (asserts! (var-get pool-active) ERR_CONTRACT_PAUSED)
     (asserts! (is-eq (get owner policy) caller) ERR_NOT_AUTHORIZED)
     (asserts! (get active policy) ERR_POLICY_NOT_FOUND)
     
     (let ((premium-amount (get premium policy)))
-      ;; Transfer premium to contract
+      ;; Transfer premium to contract (external call first - reentrancy protection)
       (try! (stx-transfer? premium-amount caller (as-contract tx-sender)))
       
-      ;; Update policy balance and pool balance
-      (map-set policies
-        { policy-id: policy-id }
-        (merge policy { 
-          balance: (+ (get balance policy) premium-amount),
-          last-updated: burn-block-height 
-        })
+      ;; Update policy balance and pool balance with safe math
+      (let (
+        (new-policy-balance (unwrap! (safe-add (get balance policy) premium-amount) ERR_OVERFLOW))
+        (new-pool-balance (unwrap! (safe-add (var-get total-pool-balance) premium-amount) ERR_OVERFLOW))
       )
-      
-      (var-set total-pool-balance (+ (var-get total-pool-balance) premium-amount))
-      
-      (ok premium-amount)
+        (map-set policies
+          { policy-id: policy-id }
+          (merge policy { 
+            balance: new-policy-balance,
+            last-updated: burn-block-height 
+          })
+        )
+        
+        (var-set total-pool-balance new-pool-balance)
+        
+        (ok premium-amount)
+      )
     )
   )
 )
@@ -223,11 +297,15 @@
 (define-public (submit-claim (policy-id uint) (claim-amount uint) (crash-data-hash (buff 32)))
   (let (
     (policy (unwrap! (map-get? policies { policy-id: policy-id }) ERR_POLICY_NOT_FOUND))
-    (claim-id (+ (var-get claim-counter) u1))
+    (current-counter (var-get claim-counter))
+    (claim-id (unwrap! (safe-add current-counter u1) ERR_OVERFLOW))
     (caller tx-sender)
   )
+    (asserts! (var-get pool-active) ERR_CONTRACT_PAUSED)
     (asserts! (is-eq (get owner policy) caller) ERR_NOT_AUTHORIZED)
     (asserts! (get active policy) ERR_POLICY_NOT_FOUND)
+    (asserts! (> claim-amount u0) ERR_INVALID_INPUT)
+    (asserts! (<= claim-amount MAX_CLAIM_AMOUNT) ERR_CLAIM_AMOUNT_TOO_HIGH)
     (asserts! (<= claim-amount (var-get total-pool-balance)) ERR_POOL_INSUFFICIENT)
     
     ;; Create claim record
@@ -258,15 +336,16 @@
     (claim (unwrap! (map-get? claims { claim-id: claim-id }) ERR_POLICY_NOT_FOUND))
     (caller tx-sender)
   )
+    (asserts! (var-get pool-active) ERR_CONTRACT_PAUSED)
     (asserts! (is-pool-member caller) ERR_NOT_MEMBER)
-    (asserts! (< burn-block-height (+ (get created-at claim) CLAIM_VOTING_PERIOD)) ERR_VOTING_ENDED)
+    (asserts! (< burn-block-height (unwrap! (safe-add (get created-at claim) CLAIM_VOTING_PERIOD) ERR_OVERFLOW)) ERR_VOTING_ENDED)
     (asserts! (not (is-some (index-of (get voters claim) caller))) ERR_ALREADY_VOTED)
     
     (let (
       (updated-voters (unwrap! (as-max-len? (append (get voters claim) caller) u100) 
                               ERR_NOT_AUTHORIZED))
-      (votes-for (if approve (+ (get votes-for claim) u1) (get votes-for claim)))
-      (votes-against (if approve (get votes-against claim) (+ (get votes-against claim) u1)))
+      (votes-for (if approve (unwrap! (safe-add (get votes-for claim) u1) ERR_OVERFLOW) (get votes-for claim)))
+      (votes-against (if approve (get votes-against claim) (unwrap! (safe-add (get votes-against claim) u1) ERR_OVERFLOW)))
     )
       ;; Update claim with vote
       (map-set claims
@@ -288,15 +367,16 @@
   (let (
     (claim (unwrap! (map-get? claims { claim-id: claim-id }) ERR_POLICY_NOT_FOUND))
   )
-    (asserts! (>= burn-block-height (+ (get created-at claim) CLAIM_VOTING_PERIOD)) ERR_VOTING_ENDED)
+    (asserts! (var-get pool-active) ERR_CONTRACT_PAUSED)
+    (asserts! (>= burn-block-height (unwrap! (safe-add (get created-at claim) CLAIM_VOTING_PERIOD) ERR_OVERFLOW)) ERR_VOTING_ENDED)
     (asserts! (> (get votes-for claim) (get votes-against claim)) ERR_NOT_AUTHORIZED)
     (asserts! (>= (var-get total-pool-balance) (get amount claim)) ERR_POOL_INSUFFICIENT)
     
-    ;; Transfer claim amount to claimant
+    ;; Transfer claim amount to claimant (external call first - reentrancy protection)
     (try! (as-contract (stx-transfer? (get amount claim) tx-sender (get claimant claim))))
     
-    ;; Update pool balance and claim status
-    (var-set total-pool-balance (- (var-get total-pool-balance) (get amount claim)))
+    ;; Update pool balance and claim status with safe math
+    (var-set total-pool-balance (unwrap! (safe-sub (var-get total-pool-balance) (get amount claim)) ERR_UNDERFLOW))
     (map-set claims
       { claim-id: claim-id }
       (merge claim { status: "approved" })
@@ -311,11 +391,13 @@
   (let (
     (total-balance (var-get total-pool-balance))
     (surplus (if (> total-balance MIN_POOL_BALANCE) 
-                (- total-balance MIN_POOL_BALANCE) 
+                (unwrap! (safe-sub total-balance MIN_POOL_BALANCE) ERR_UNDERFLOW)
                 u0))
   )
+    (asserts! (var-get pool-active) ERR_CONTRACT_PAUSED)
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
     (asserts! (> surplus u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (> year u0) ERR_INVALID_INPUT)
     
     ;; This would distribute surplus based on safety scores
     ;; Implementation would iterate through all active policies
@@ -374,6 +456,22 @@
   (/ (* BASE_PREMIUM risk-score) u50)
 )
 
+;; NEW: Security read-only functions
+(define-read-only (is-pool-active)
+  (var-get pool-active))
+
+(define-read-only (get-rate-limit-blocks)
+  RATE_LIMIT_BLOCKS)
+
+(define-read-only (get-last-operation-block (user principal))
+  (default-to u0 (map-get? last-operation-block user)))
+
+(define-read-only (get-max-claim-amount)
+  MAX_CLAIM_AMOUNT)
+
+(define-read-only (get-max-policies-per-member)
+  MAX_POLICIES_PER_MEMBER)
+
 ;; private functions
 
 ;; Validate risk score range
@@ -385,10 +483,12 @@
 (define-private (calculate-member-surplus (policy-id uint) (total-surplus uint))
   (match (map-get? policies { policy-id: policy-id })
     policy (let (
-      (risk-factor (- u100 (get risk-score policy)))
+      (risk-factor (unwrap-panic (safe-sub u100 (get risk-score policy))))
       (time-factor (if (> burn-block-height (get last-updated policy)) u100 u50))
+      (product1 (unwrap-panic (safe-mul total-surplus risk-factor)))
+      (product2 (unwrap-panic (safe-mul product1 time-factor)))
     )
-      (/ (* total-surplus risk-factor time-factor) u10000)
+      (unwrap-panic (safe-div product2 u10000))
     )
     u0
   )
